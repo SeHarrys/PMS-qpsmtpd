@@ -1,0 +1,205 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+queue/maildir_pms
+
+=head1 CONFIG
+
+The directorys must be created and perms ok, no checks perms
+
+/etc/qpsmtpd/plugins => queue/maildir_pms /var/pms/
+
+=cut
+
+use Qpsmtpd::DSN;
+
+use Sys::Hostname qw(hostname);
+use Time::HiRes qw(gettimeofday);
+use Net::SMTP;
+use DBIx::Custom;
+use Cwd qw(abs_path);
+
+use Data::Dumper;
+
+sub register {
+  my ($self, $qp, @args) = @_;
+
+  ($self->{_maildir}) = ($args[0] =~ m!([/\w\.]+)!);
+  
+  $self->{_db_user} = $args[1];
+  $self->{_db_pass} = $args[2]; 
+  
+  $self->{_smtp_relay_host} = '127.0.0.1';
+  $self->{_smtp_relay_port} = 12025;
+
+  my $hostname = (hostname =~ m/([\w\._\-]+)/)[0];
+  $self->{_hostname} = $hostname;
+
+  $self->{_db} = DBIx::Custom->connect(
+      dsn => "dbi:mysql:database=pms:127.0.0.1",
+      user => 'pms',
+      password => '',
+      connector => 1,
+      #option => {mysql_enable_utf8 => 1},
+      );
+
+}
+
+my $maildir_counter = 0;
+
+sub hook_queue {
+  my ($self, $transaction) = @_;
+
+  # Get the domain the mail is sent to, and archive it.
+  foreach my $recipient ( $transaction->recipients )  {
+    $recipient =~ s/^<//g;
+    $recipient =~ s/>$//g;
+
+    my ($user,$domain);
+    my $rcpt_to = $recipient;
+
+    if ( $recipient =~ /(.*)@(.*)/ ) {
+	$user = $1;
+        $recipient = $2;
+    }
+    
+    $user = lc $user;
+    $recipient = lc $recipient;
+
+    # Comprobar si el dominio tiene un alias
+    my $Alias = $self->{_db}->execute('SELECT alias FROM domains WHERE dominio = :domain', { domain => $recipient } )->fetch_hash;
+    $recipient = $Alias->{alias} if $Alias->{alias};
+
+    # FIXME
+    my $dir =  $self->{_maildir} . $recipient.'/'.$user.'/Maildir/';
+
+    if (! -e $dir ){
+	my @rcpt_hosts = ($self->qp->config("me"), $self->qp->config("rcpthosts"));
+	
+	for my $allowed (@rcpt_hosts) {
+	    $allowed =~ s/^\s*(\S+)/$1/;
+	    return Qpsmtpd::DSN->no_such_user() if $recipient eq lc $allowed;
+	    return Qpsmtpd::DSN->no_such_user() if substr($allowed,0,1) eq "." and $recipient =~ m/\Q$allowed\E$/i;
+	}
+	
+	if ( $self->auth_user() ) {
+	    #$self->log(LOGINFO, "Net::SMTP => $server:$puerto");
+
+	    my $smtp = Net::SMTP->new( $self->{_smtp_relay_host}, Port => $self->{_smtp_relay_port}, Timeout => 30, Hello => $self->qp->config("me"), ) || die $!;
+	    $smtp->mail( $transaction->sender->address || "" ) or return(DECLINED, "Unable to queue message ($!)");
+
+	    for ($transaction->recipients) {
+		$smtp->to($_->address) or return(DECLINED, "Unable to queue message ($!)");
+	    }
+
+	    $smtp->data() or return(DECLINED, "Unable to queue message ($!)");
+	    $smtp->datasend($transaction->header->as_string) or return(DECLINED, "Unable to queue message ($!)");
+	    $transaction->body_resetpos;
+
+	    while (my $line = $transaction->body_getline) {
+		$smtp->datasend($line) or return(DECLINED, "Unable to queue message ($!)");
+	    }
+
+	    $smtp->dataend() or return(DECLINED, "Unable to queue message ($!)");
+	    $smtp->quit() or return(DECLINED, "Unable to queue message ($!)");
+	    $self->log(LOGINFO, "finished queueing");
+
+	    return (OK, "Queued!");
+	} else {
+	    #$self->log(LOGWARN,"TRY RELAY - 515");
+	    return Qpsmtpd::DSN->relaying_denied();
+	}
+    }
+    
+    ## Denegamos las entradas tontas : Entran por que esta WhiteList SpamAssasin con el dominio
+    my $headers = $transaction->header();
+    
+    ## Deny 
+    return Qpsmtpd::DSN->relaying_denied() if $transaction->sender->address eq $rcpt_to && ! $self->auth_user();
+
+    ## FIXME : Solucionamos los users segun si tienen un enlace simbolico.
+    my $real_path = abs_path($dir);
+    $real_path  =~ /^\/.*\/(.*)\/Maildir/;
+    my $real_user = $1;
+
+    $self->log(LOGINFO, "Real Path: $real_user == $user");
+
+    $user = $real_user unless $user eq $real_user;
+
+    while( $dir =~ /(.*)[\\\/]\.\.[\\\/](.*)/ ) {
+        $dir = $1 . "$1_.._$2";
+    }
+    
+    my ($time, $microseconds) = gettimeofday;
+
+    $time = ($time =~ m/(\d+)/)[0];
+    $microseconds =~ s/\D//g;
+
+    my $unique  = "P$$" . "M$microseconds" . "Q" . $maildir_counter++;
+    my $file    = join ".", $time, $unique, $self->{_hostname};
+
+    my $dir_tmp = $dir."/tmp/".$file;
+    my $dir_new = $dir."/new/".$file;
+    
+    my $mail_from = $transaction->sender->address;
+    my ( $mail_user , $mail_domain ) = split "@", $mail_from;
+
+    $mail_domain =~ s/^\s+//;
+    $mail_domain =~ s/\s+$//;
+
+=doc
+    Filters
+=cut
+    my $MailFilters = $self->{_db}->execute('SELECT f.* FROM control c LEFT JOIN filters f ON f.control = c.id WHERE c.pw_name = :user AND c.pw_domain = :domain' , { user => $user , domain => $recipient } )->fetch_hash_all;
+
+    if ( scalar @{$MailFilters} ) {
+	foreach my $F (@{$MailFilters}) {
+	    if ( $F->{method} eq 'headers' && $headers->get($F->{method_arg}) =~ /$F->{value}/ ) {
+		$dir_tmp = $dir.$F->{out}.'/tmp/'.$file;
+		$dir_new = $dir.$F->{out}.'/new/'.$file;
+	    } elsif ( $F->{method} eq 'from' ) {
+		if ( $F->{method_arg} eq 'domain' && $mail_domain eq $F->{value} ) {
+                    $dir_tmp = $dir.$F->{out}.'/tmp/'.$file;
+                    $dir_new = $dir.$F->{out}.'/new/'.$file;
+                } elsif ( $F->{method_arg} eq 'email' && $transaction->sender->address eq $F->{value} ) {
+                    $dir_tmp = $dir.$F->{out}.'/tmp/'.$file;
+                    $dir_new = $dir.$F->{out}.'/new/'.$file;
+                }
+	    } elsif ( $F->{method} eq 'thread' ) {
+		$self->log(LOGINFO, "Thread: ".$headers->get('Message-ID'));
+	    }
+	}
+    }
+
+=doc
+    Save email
+=cut
+
+    open (MF, ">$dir_tmp") or
+      $self->log(LOGWARN, "could not open $dir_tmp: $!"),
+        return(DECLINED, "queue error (open)");
+
+    $transaction->header->print(\*MF);
+    $transaction->body_resetpos;
+
+    while (my $line = $transaction->body_getline) {
+        print MF $line;
+    }
+    
+    close MF or
+	$self->log(LOGWARN, "could not close $dir/tmp/$file: $!")
+        and return(DECLINED, "queue error (close)");
+    
+    link "$dir_tmp", "$dir_new" or
+	$self->log(LOGWARN, "could not link $dir/tmp/$file to $dir/new/$file: $!")
+        and return(DECLINED, "queue error (link)");
+    
+    unlink "$dir_tmp";
+  }
+  
+  my $msg_id = $transaction->header->get('Message-Id') || '';
+  $msg_id =~ s/[\r\n].*//s;
+
+  return (OK, "Queued! $msg_id");
+}
